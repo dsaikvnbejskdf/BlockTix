@@ -1,303 +1,182 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import "forge-std/Test.sol";
+import "../src/PriceOracle.sol";
 
-/**
- * @title PriceOracle
- * @notice Handles dynamic pricing for ticket sales based on demand and time
- * @dev implements surge pricing and time based adjustments
- */
-contract PriceOracle is Ownable, Pausable {
-    // State Variables
-    uint256 public demandMultiplierBasisPoints; // basis points, 100 = 1%
-    uint256 public timeDecayBasisPoints; // basis points for time based discount
-    address public blockTixMain;
+contract PriceOracleTest is Test {
+    PriceOracle public oracle;
 
-    // Price adjustment thresholds
-    uint256 public constant SURGE_THRESHOLD_1 = 50; // 50% sold (or 50 tickets depending on usage)
-    uint256 public constant SURGE_THRESHOLD_2 = 75; // 75% sold
-    uint256 public constant SURGE_THRESHOLD_3 = 90; // 90% sold
+    address owner = address(0xA1);
+    address main = address(0xB1);
+    address attacker = address(0xC1);
 
-    // Surge multipliers in basis points
-    uint256 public surgeMultiplier1 = 500; // 5% increase
-    uint256 public surgeMultiplier2 = 1000; // 10% increase
-    uint256 public surgeMultiplier3 = 2000; // 20% increase
-
-    // Mappings
-    mapping(uint256 => PriceHistory[]) public eventPriceHistory;
-
-    // Structs
-    struct PriceHistory {
-        uint256 timestamp;
-        uint256 price;
-        uint256 ticketsSold;
+    function setUp() public {
+        vm.startPrank(owner);
+        oracle = new PriceOracle(
+            owner,
+            main,
+            0,     // demand multiplier
+            0      // time decay
+        );
+        vm.stopPrank();
     }
 
-    // Events
-    event PriceCalculated(uint256 indexed eventId, uint256 price, uint256 ticketsSold);
-    event DemandMultiplierUpdated(uint256 oldMultiplier, uint256 newMultiplier);
-    event TimeDecayUpdated(uint256 oldDecay, uint256 newDecay);
-    event SurgeMultipliersUpdated(uint256 surge1, uint256 surge2, uint256 surge3);
-    event BlockTixMainUpdated(address indexed oldAddress, address indexed newAddress);
+    // ------------------------------------------------------------
+    // ONLY BLOCKTIXMAIN
+    // ------------------------------------------------------------
 
-    // Errors
-    error OnlyBlockTixMain();
-    error InvalidParameters();
-    error InvalidAddress();
-
-    // Modifiers
-    modifier onlyBlockTixMain() {
-        if (msg.sender != blockTixMain) revert OnlyBlockTixMain();
-        _;
+    function test_CalculatePrice_OnlyBlockTixMain() public {
+        vm.expectRevert(PriceOracle.OnlyBlockTixMain.selector);
+        oracle.calculatePrice(1, 100 ether, 10);
     }
 
-    /**
-     * @notice Constructor
-     * @param initialOwner Address of the contract owner
-     * @param _blockTixMain Address of BlockTixMain contract
-     * @param _demandMultiplier Initial demand multiplier in basis points
-     * @param _timeDecay Initial time decay in basis points
-     */
-    constructor(
-        address initialOwner,
-        address _blockTixMain,
-        uint256 _demandMultiplier,
-        uint256 _timeDecay
-    ) Ownable(initialOwner) {
-        if (_blockTixMain == address(0)) revert InvalidAddress();
+    // ------------------------------------------------------------
+    // SURGE PRICING TESTS
+    // ------------------------------------------------------------
 
-        blockTixMain = _blockTixMain;
-        demandMultiplierBasisPoints = _demandMultiplier;
-        timeDecayBasisPoints = _timeDecay;
+    function test_Surge_NoIncrease() public {
+        vm.prank(main);
+        uint256 price = oracle.calculatePrice(1, 100 ether, 10); // < 50 tickets
+        assertEq(price, 100 ether);
     }
 
-    /**
-     * @notice Calculate dynamic price for ticket (surge only)
-     * @param eventId ID of event
-     * @param basePrice Base price of ticket
-     * @param ticketsSold Number of tickets sold already
-     * @return Calculated price in wei
-     */
-    function calculatePrice(
-        uint256 eventId,
-        uint256 basePrice,
-        uint256 ticketsSold
-    ) external whenNotPaused onlyBlockTixMain returns (uint256) {
-        uint256 price = basePrice;
+    function test_Surge_50Percent() public {
+        vm.prank(main);
+        uint256 price = oracle.calculatePrice(1, 100 ether, 50); // >= 50
 
-        // Apply surge + demand multiplier
-        price = _applySurgePricing(price, ticketsSold);
+        // Default: 5% = 500 basis points
+        uint256 expected = 100 ether + (100 ether * 500) / 10000;
+        assertEq(price, expected);
+    }
 
-        // Record price in history
-        eventPriceHistory[eventId].push(
-            PriceHistory({timestamp: block.timestamp, price: price, ticketsSold: ticketsSold})
+    function test_Surge_75Percent() public {
+        vm.prank(main);
+        uint256 price = oracle.calculatePrice(1, 100 ether, 75);
+
+        uint256 expected = 100 ether + (100 ether * 1000) / 10000;
+        assertEq(price, expected);
+    }
+
+    function test_Surge_90Percent() public {
+        vm.prank(main);
+        uint256 price = oracle.calculatePrice(1, 100 ether, 90);
+
+        uint256 expected = 100 ether + (100 ether * 2000) / 10000;
+        assertEq(price, expected);
+    }
+
+    // ------------------------------------------------------------
+    // PRICE HISTORY
+    // ------------------------------------------------------------
+
+    function test_PriceHistoryAppends() public {
+        vm.prank(main);
+        oracle.calculatePrice(1, 100 ether, 10);
+
+        PriceOracle.PriceHistory[] memory h = oracle.getPriceHistory(1);
+        assertEq(h.length, 1);
+        assertEq(h[0].price, 100 ether);
+        assertEq(h[0].ticketsSold, 10);
+    }
+
+    // ------------------------------------------------------------
+    // TIME DECAY PRICING
+    // ------------------------------------------------------------
+
+    function test_TimeDecay_AppliesDiscount() public {
+        // enable time decay
+        vm.prank(owner);
+        oracle.setTimeDecay(1000); // 10%
+
+        uint256 eventDate = block.timestamp + 8 days; // more than 1 week away
+
+        vm.prank(main);
+        uint256 price = oracle.calculatePriceWithTimeDecay(
+            1,
+            100 ether,
+            0,
+            100,
+            eventDate
         );
 
-        emit PriceCalculated(eventId, price, ticketsSold);
-
-        return price;
+        uint256 expected = 100 ether - (100 ether * 1000 / 10000);
+        assertEq(price, expected);
     }
 
-    /**
-     * @notice Calculate price with time-based adjustment
-     * @param eventId ID of the event
-     * @param basePrice Base price of the ticket
-     * @param ticketsSold Number of tickets already sold
-     * @param totalTickets Total tickets available
-     * @param eventDate Unix timestamp of the event
-     * @return Calculated price with time adjustment
-     */
-    function calculatePriceWithTimeDecay(
-        uint256 eventId,
-        uint256 basePrice,
-        uint256 ticketsSold,
-        uint256 totalTickets,
-        uint256 eventDate
-    ) external whenNotPaused onlyBlockTixMain returns (uint256) {
-        uint256 price = basePrice;
+    function test_TimeDecay_NoDiscount_WhenLessThanWeek() public {
+        vm.prank(owner);
+        oracle.setTimeDecay(1000);
 
-        // Apply surge pricing (percentage-based) + demand multiplier
-        uint256 soldPercentage = (ticketsSold * 100) / totalTickets;
-        price = _applySurgePricingWithPercentage(price, soldPercentage);
+        uint256 eventDate = block.timestamp + 2 days;
 
-        // Apply time decay if applicable
-        if (block.timestamp < eventDate) {
-            uint256 timeUntilEvent = eventDate - block.timestamp;
-            uint256 oneWeek = 7 days;
-
-            // Apply discount if event is more than 1 week away
-            if (timeUntilEvent > oneWeek) {
-                uint256 discount = (price * timeDecayBasisPoints) / 10000;
-                price = price - discount;
-            }
-        }
-
-        // Record price in history
-        eventPriceHistory[eventId].push(
-            PriceHistory({timestamp: block.timestamp, price: price, ticketsSold: ticketsSold})
+        vm.prank(main);
+        uint256 price = oracle.calculatePriceWithTimeDecay(
+            1,
+            100 ether,
+            0,
+            100,
+            eventDate
         );
 
-        emit PriceCalculated(eventId, price, ticketsSold);
-
-        return price;
+        // Should be equal to base price (no surge & no discount)
+        assertEq(price, 100 ether);
     }
 
-    /**
-     * @notice Validate resale price against markup limits
-     * @param originalPrice Original purchase price
-     * @param resalePrice Proposed resale price
-     * @param maxMarkupBasisPoints Maximum allowed markup in basis points
-     * @return bool true if resale price is valid
-     */
-    function validateResalePrice(
-        uint256 originalPrice,
-        uint256 resalePrice,
-        uint256 maxMarkupBasisPoints
-    ) external pure returns (bool) {
-        uint256 maxAllowedPrice = originalPrice + (originalPrice * maxMarkupBasisPoints) / 10000;
-        return resalePrice <= maxAllowedPrice;
+    // ------------------------------------------------------------
+    // OWNER FUNCTIONS
+    // ------------------------------------------------------------
+
+    function test_Owner_SetDemandMultiplier() public {
+        vm.prank(owner);
+        oracle.setDemandMultiplier(2000);
+
+        assertEq(oracle.demandMultiplierBasisPoints(), 2000);
     }
 
-    /**
-     * @notice Internal function to apply surge pricing based on tickets sold
-     *         Also applies demand multiplier if set
-     */
-    function _applySurgePricing(uint256 basePrice, uint256 ticketsSold) internal view returns (uint256) {
-        uint256 price = basePrice;
-
-        if (ticketsSold >= SURGE_THRESHOLD_3) {
-            price = basePrice + (basePrice * surgeMultiplier3) / 10000;
-        } else if (ticketsSold >= SURGE_THRESHOLD_2) {
-            price = basePrice + (basePrice * surgeMultiplier2) / 10000;
-        } else if (ticketsSold >= SURGE_THRESHOLD_1) {
-            price = basePrice + (basePrice * surgeMultiplier1) / 10000;
-        }
-
-        // Apply demand multiplier on top if configured
-        if (demandMultiplierBasisPoints > 0) {
-            uint256 demandIncrease = (price * demandMultiplierBasisPoints) / 10000;
-            price = price + demandIncrease;
-        }
-
-        return price;
+    function test_Owner_SetDemandMultiplier_Revert_TooHigh() public {
+        vm.prank(owner);
+        vm.expectRevert(PriceOracle.InvalidParameters.selector);
+        oracle.setDemandMultiplier(6000);
     }
 
-    /**
-     * @notice Internal function to apply surge pricing based on percentage
-     *         Also applies demand multiplier if set
-     */
-    function _applySurgePricingWithPercentage(
-        uint256 basePrice,
-        uint256 soldPercentage
-    ) internal view returns (uint256) {
-        uint256 price = basePrice;
+    function test_Owner_SetTimeDecay() public {
+        vm.prank(owner);
+        oracle.setTimeDecay(1500);
 
-        if (soldPercentage >= SURGE_THRESHOLD_3) {
-            price = basePrice + (basePrice * surgeMultiplier3) / 10000;
-        } else if (soldPercentage >= SURGE_THRESHOLD_2) {
-            price = basePrice + (basePrice * surgeMultiplier2) / 10000;
-        } else if (soldPercentage >= SURGE_THRESHOLD_1) {
-            price = basePrice + (basePrice * surgeMultiplier1) / 10000;
-        }
-
-        // Apply demand multiplier on top if configured
-        if (demandMultiplierBasisPoints > 0) {
-            uint256 demandIncrease = (price * demandMultiplierBasisPoints) / 10000;
-            price = price + demandIncrease;
-        }
-
-        return price;
+        assertEq(oracle.timeDecayBasisPoints(), 1500);
     }
 
-    /**
-     * @notice Update demand multiplier
-     * @param newMultiplier New multiplier in basis points
-     */
-    function setDemandMultiplier(uint256 newMultiplier) external onlyOwner {
-        if (newMultiplier > 5000) revert InvalidParameters(); // Max 50%
+    function test_Owner_SetSurgeMultipliers() public {
+        vm.prank(owner);
+        oracle.setSurgeMultipliers(300, 700, 1500);
 
-        uint256 oldMultiplier = demandMultiplierBasisPoints;
-        demandMultiplierBasisPoints = newMultiplier;
-
-        emit DemandMultiplierUpdated(oldMultiplier, newMultiplier);
+        assertEq(oracle.surgeMultiplier1(), 300);
+        assertEq(oracle.surgeMultiplier2(), 700);
+        assertEq(oracle.surgeMultiplier3(), 1500);
     }
 
-    /**
-     * @notice Update time decay percentage
-     * @param newDecay New decay in basis points
-     */
-    function setTimeDecay(uint256 newDecay) external onlyOwner {
-        if (newDecay > 5000) revert InvalidParameters(); // Max 50%
+    // ------------------------------------------------------------
+    // PAUSE TESTS
+    // ------------------------------------------------------------
 
-        uint256 oldDecay = timeDecayBasisPoints;
-        timeDecayBasisPoints = newDecay;
+    function test_Pause_StopsPriceCalculation() public {
+        vm.prank(owner);
+        oracle.pause();
 
-        emit TimeDecayUpdated(oldDecay, newDecay);
+        vm.prank(main);
+        vm.expectRevert("Pausable: paused");
+        oracle.calculatePrice(1, 100 ether, 10);
     }
 
-    /**
-     * @notice Update surge multipliers
-     * @param _surge1 Multiplier for 50% threshold
-     * @param _surge2 Multiplier for 75% threshold
-     * @param _surge3 Multiplier for 90% threshold
-     */
-    function setSurgeMultipliers(uint256 _surge1, uint256 _surge2, uint256 _surge3) external onlyOwner {
-        if (_surge1 > _surge2 || _surge2 > _surge3) revert InvalidParameters();
+    function test_Unpause_RestoresOperations() public {
+        vm.startPrank(owner);
+        oracle.pause();
+        oracle.unpause();
+        vm.stopPrank();
 
-        surgeMultiplier1 = _surge1;
-        surgeMultiplier2 = _surge2;
-        surgeMultiplier3 = _surge3;
-
-        emit SurgeMultipliersUpdated(_surge1, _surge2, _surge3);
-    }
-
-    /**
-     * @notice Update BlockTixMain contract address
-     * @param newBlockTixMain New address
-     */
-    function setBlockTixMain(address newBlockTixMain) external onlyOwner {
-        if (newBlockTixMain == address(0)) revert InvalidAddress();
-
-        address oldAddress = blockTixMain;
-        blockTixMain = newBlockTixMain;
-
-        emit BlockTixMainUpdated(oldAddress, newBlockTixMain);
-    }
-
-    /**
-     * @notice Pause the contract
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @notice Unpause the contract
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /**
-     * @notice Get price history for an event
-     * @param eventId ID of the event
-     * @return PriceHistory array
-     */
-    function getPriceHistory(uint256 eventId) external view returns (PriceHistory[] memory) {
-        return eventPriceHistory[eventId];
-    }
-
-    /**
-     * @notice Get the latest price for an event
-     * @param eventId ID of the event
-     * @return Latest price
-     */
-    function getLatestPrice(uint256 eventId) external view returns (uint256) {
-        PriceHistory[] memory history = eventPriceHistory[eventId];
-        if (history.length == 0) return 0;
-        return history[history.length - 1].price;
+        vm.prank(main);
+        uint256 price = oracle.calculatePrice(1, 100 ether, 5);
+        assertEq(price, 100 ether);
     }
 }
-
